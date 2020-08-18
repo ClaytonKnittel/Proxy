@@ -15,7 +15,7 @@
 #include <get_ip_addr.h>
 
 
-#define MSG_BUF_SIZE 0x10000
+#define MSG_BUF_SIZE 0x100000
 
 #define STR2(x) #x
 #define STR(X) STR2(X)
@@ -32,6 +32,9 @@
 // request types
 #define TYPE_GET 0
 #define TYPE_CONNECT 1
+
+
+size_t n_send = 0, n_rec = 0;
 
 
 struct client {
@@ -99,7 +102,7 @@ int client_rearm_client(struct conn_manager * cm, struct client * c) {
             EV_ADD | EV_ENABLE | EV_DISPATCH, 0, 0, c);
 
     if (kevent(cm->qfd, &ev, 1, NULL, 0, NULL) == -1) {
-        fprintf(stderr, "Unable to arm dstfd, reason: %s\n",
+        fprintf(stderr, "Unable to arm clientfd, reason: %s\n",
                 strerror(errno));
         close(c->clientfd);
         c->clientfd = -1;
@@ -386,9 +389,16 @@ static int read_from(struct conn_manager * cm, struct client * c, int connfd) {
 
     ssize_t n_read = read(connfd, buf, sizeof(buf));
 
-    if (n_read == -1) {
-        fprintf(stderr, "Unable to read data from connfd %d, reason: %s\n",
-                connfd, strerror(errno));
+    printf("read %zd\n", n_read);
+
+    if (n_read == -1 || n_read == 0) {
+        if (n_read == -1) {
+            fprintf(stderr, "Unable to read data from connfd %d, reason: %s\n",
+                    connfd, strerror(errno));
+        }
+        else {
+            fprintf(stderr, "Got empty request, so terminating connection\n");
+        }
         if (connfd == c->clientfd) {
             fprintf(stderr, "was client\n");
             close_client(cm, c);
@@ -399,6 +409,10 @@ static int read_from(struct conn_manager * cm, struct client * c, int connfd) {
             client_rearm_client(cm, c);
         }
         return -1;
+    }
+
+    if (*buf >= 'A' && *buf <= 'Z') {
+        printf("buf: \"%.100s\"\n", buf);
     }
 
     //printf("buf: \"%s\"\n", buf);
@@ -431,6 +445,8 @@ static int read_from(struct conn_manager * cm, struct client * c, int connfd) {
         // forward, unmodified, to destination
         write(c->dstfd, buf, n_read);
 
+        n_send++;
+
         // arm dstfd for reading in event queue
         //return client_rearm_host(cm, c);
         return client_rearm_client(cm, c);
@@ -440,6 +456,8 @@ static int read_from(struct conn_manager * cm, struct client * c, int connfd) {
 
         // forward to client
         write(c->clientfd, buf, n_read);
+
+        n_rec++;
 
         // rearm clientfd for reading in event queue
         return client_rearm_client(cm, c);
@@ -479,6 +497,7 @@ void conn_manager_start(struct conn_manager *cm) {
             // msg from existing connection
             c = event.udata;
             read_from(cm, c, fd);
+            printf("Ratio: %zu/%zu\n", n_send, n_rec);
         }
     }
 }
