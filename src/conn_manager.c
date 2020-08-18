@@ -34,8 +34,6 @@
 #define TYPE_CONNECT 1
 
 
-size_t n_send = 0, n_rec = 0;
-
 
 struct client {
     // file descriptor on which requests are received and responses are
@@ -445,8 +443,6 @@ static int read_from(struct conn_manager * cm, struct client * c, int connfd) {
         // forward, unmodified, to destination
         write(c->dstfd, buf, n_read);
 
-        n_send++;
-
         // arm dstfd for reading in event queue
         //return client_rearm_host(cm, c);
         return client_rearm_client(cm, c);
@@ -456,8 +452,6 @@ static int read_from(struct conn_manager * cm, struct client * c, int connfd) {
 
         // forward to client
         write(c->clientfd, buf, n_read);
-
-        n_rec++;
 
         // rearm clientfd for reading in event queue
         return client_rearm_client(cm, c);
@@ -497,7 +491,6 @@ void conn_manager_start(struct conn_manager *cm) {
             // msg from existing connection
             c = event.udata;
             read_from(cm, c, fd);
-            printf("Ratio: %zu/%zu\n", n_send, n_rec);
         }
     }
 }
