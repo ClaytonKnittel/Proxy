@@ -15,7 +15,7 @@
 #include <get_ip_addr.h>
 
 
-#define MSG_BUF_SIZE 1024
+#define MSG_BUF_SIZE 0x10000
 
 #define STR2(x) #x
 #define STR(X) STR2(X)
@@ -91,10 +91,12 @@ void client_disconnect_host(struct conn_manager * cm, struct client * c) {
     c->dstfd = -1;
 }
 
+int client_rearm_host(struct conn_manager * cm, struct client * c);
+
 int client_rearm_client(struct conn_manager * cm, struct client * c) {
     struct kevent ev;
     EV_SET(&ev, c->clientfd, EVFILT_READ,
-            EV_ENABLE | EV_DISPATCH, 0, 0, c);
+            EV_ADD | EV_ENABLE | EV_DISPATCH, 0, 0, c);
 
     if (kevent(cm->qfd, &ev, 1, NULL, 0, NULL) == -1) {
         fprintf(stderr, "Unable to arm dstfd, reason: %s\n",
@@ -103,13 +105,14 @@ int client_rearm_client(struct conn_manager * cm, struct client * c) {
         c->clientfd = -1;
         return -1;
     }
+    client_rearm_host(cm, c);
     return 0;
 }
 
 int client_rearm_host(struct conn_manager * cm, struct client * c) {
     struct kevent ev;
     EV_SET(&ev, c->dstfd, EVFILT_READ,
-            EV_ADD | EV_DISPATCH, 0, 0, c);
+            EV_ADD | EV_ENABLE | EV_DISPATCH, 0, 0, c);
 
     if (kevent(cm->qfd, &ev, 1, NULL, 0, NULL) == -1) {
         fprintf(stderr, "Unable to arm dstfd, reason: %s\n",
@@ -398,7 +401,7 @@ static int read_from(struct conn_manager * cm, struct client * c, int connfd) {
         return -1;
     }
 
-    printf("buf: \"%s\"\n", buf);
+    //printf("buf: \"%s\"\n", buf);
 
     if (connfd == c->clientfd) {
         if (c->dstfd == -1) {
@@ -408,7 +411,9 @@ static int read_from(struct conn_manager * cm, struct client * c, int connfd) {
                 fprintf(stderr, "AHH BAD\n");
                 const static char bad_request[] = "HTTP/1.1 400 BAD REQUEST\r\n\r\n";
                 write(c->clientfd, bad_request, sizeof(bad_request) - 1);
-                return -1;
+
+                // rearm clientfd for reading in event queue
+                return client_rearm_client(cm, c);
             }
             c->dstfd = res;
 
@@ -427,7 +432,8 @@ static int read_from(struct conn_manager * cm, struct client * c, int connfd) {
         write(c->dstfd, buf, n_read);
 
         // arm dstfd for reading in event queue
-        return client_rearm_host(cm, c);
+        //return client_rearm_host(cm, c);
+        return client_rearm_client(cm, c);
     }
     else {
         printf("sending back response\n");
