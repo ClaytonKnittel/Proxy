@@ -682,13 +682,10 @@ static int read_from(struct conn_manager * cm, struct client * c, int connfd) {
 
     if (from_client) {
         if (c->dstfd == -1) {
-            printf("figger\n");
             if (conn_manager_has_forward(cm)) {
                 c->dstfd = conn_manager_dup_forward_fd(cm);
-                printf("Made %d\n", c->dstfd);
             }
             else {
-                printf("normal?\n");
                 int req_type;
                 int res = _resolve_host(cm, c, buf, &req_type);
                 if (res == -1) {
@@ -720,9 +717,6 @@ static int read_from(struct conn_manager * cm, struct client * c, int connfd) {
         c->host_buffer_len += n_read;
 
         //printf("read some data, now host buffer len is %llu\n", c->host_buffer_len);
-
-        // forward, unmodified, to destination
-        //write(c->dstfd, buf, n_read);
 
         return client_rearm(cm, c);
     }
