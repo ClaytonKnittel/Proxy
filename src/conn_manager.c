@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include <arpa/inet.h>
@@ -35,6 +36,11 @@
 #define MAX_PORT 8
 // http/1.1
 #define MAX_VERSION 32
+
+
+#ifndef EPOLLEXCLUSIVE
+#define EPOLLEXCLUSIVE (1 << 28)
+#endif
 
 
 
@@ -96,8 +102,10 @@ void client_init(struct client * c) {
 }
 
 void close_client(struct conn_manager * cm, struct client * c) {
+#ifdef __APPLE__
     struct kevent ev[4];
     int len = 0;
+#endif
 
     if (c->clientfd != -1) {
 #ifdef __APPLE__
@@ -279,7 +287,7 @@ int client_rearm(struct conn_manager * cm, struct client * c) {
         events |= host_buffer_ready ? EPOLLOUT : 0;
         struct epoll_event event = {
             .events = events,
-            .data.ptr = ((uint64_t) c) | HOST_FD_BMASK
+            .data.u64 = ((uint64_t) c) | HOST_FD_BMASK
         };
 
         int mode;
@@ -290,7 +298,7 @@ int client_rearm(struct conn_manager * cm, struct client * c) {
             mode = EPOLL_CTL_ADD;
             client_set_host_in_queue(c);
         }
-        if (epoll_ctl(cm->qfd, mode, c->hostfd, &event) < 0) {
+        if (epoll_ctl(cm->qfd, mode, c->dstfd, &event) < 0) {
             fprintf(stderr, "Unable to add host read/write fd to epoll, reason: %s\n",
                     strerror(errno));
             close_client(cm, c);
@@ -349,7 +357,9 @@ static void _print_ipv4(struct sockaddr *s) {
 
 int conn_manager_init(struct conn_manager *cm, int rec_port, int send_port) {
     int sock, q;
+#ifdef __APPLE__
     struct kevent e;
+#endif
 
     __builtin_memset(&cm->in, 0, sizeof(cm->in));
 
@@ -402,9 +412,9 @@ int conn_manager_init(struct conn_manager *cm, int rec_port, int send_port) {
         // can be treated as a client object for the purposes of finding out
         // which file descriptor the event is associated with
         .data.ptr = ((char*) &cm->listenfd) -
-            offsetof(epoll_data_ptr_t, struct client);
+            offsetof(struct client, clientfd)
     };
-    if (epoll_ctl(server->qfd, EPOLL_CTL_ADD, server->sockfd, &listen_ev) < 0) {
+    if (epoll_ctl(cm->qfd, EPOLL_CTL_ADD, cm->listenfd, &listen_ev) < 0) {
 #endif
         fprintf(stderr, "Unable to add server listenfd to " QUEUE_T "\n");
         conn_manager_close(cm);
@@ -774,11 +784,11 @@ void conn_manager_start(struct conn_manager *cm) {
     while (1) {
         if ((ret =
 #ifdef __APPLE__
-                    kevent(cm->qfd, NULL, 0, &event, 1, NULL))
+                    kevent(cm->qfd, NULL, 0, &event, 1, NULL)
 #elif __linux__
-                    epoll(cm->qfd, &event, 1, -1)
+                    epoll_wait(cm->qfd, &event, 1, -1)
 #endif
-                == -1) {
+                ) == -1) {
             fprintf(stderr, QUEUE_T " call failed on fd %d, reason: %s\n",
                     cm->qfd, strerror(errno));
             break;
@@ -797,14 +807,32 @@ void conn_manager_start(struct conn_manager *cm) {
             ret = _accept_connection(cm);
         }
         else {
-            if (event.filter == EVFILT_WRITE) {
+            if (
+#ifdef __APPLE__
+                    event.filter == EVFILT_WRITE
+#elif __linux__
+                    event.events & EPOLLOUT
+#endif
+                    ) {
                 write_to(cm, c, fd);
             }
-            else if (event.filter == EVFILT_READ) {
+            else if (
+#ifdef __APPLE__
+                    event.filter == EVFILT_READ
+#elif __linux__
+                    event.events & EPOLLIN
+#endif
+                    ) {
                 // msg from existing connection
                 read_from(cm, c, fd);
             }
-            if (event.flags & EV_EOF) {
+            if (
+#ifdef __APPLE__
+                    event.flags & EV_EOF
+#elif __linux__
+                    event.events & EPOLLRDHUP
+#endif
+                    ) {
                 if (c->clientfd == fd) {
                     client_read_end_closed(cm, c);
                 }
