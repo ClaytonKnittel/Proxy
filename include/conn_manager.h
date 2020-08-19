@@ -23,8 +23,7 @@ struct conn_manager {
     int qfd;
 
     struct sockaddr_in in;
-
-    int forward_sockfd;
+    struct sockaddr_in forward_addr;
 };
 
 

@@ -430,6 +430,12 @@ int conn_manager_init(struct conn_manager *cm, int rec_port, int send_port) {
 int conn_manager_set_forwarding(struct conn_manager * cm,
         struct sockaddr_in addr) {
 
+    __builtin_memcpy(&cm->forward_addr, &addr, sizeof(struct sockaddr_in));
+
+    return 0;
+}
+
+static int conn_manager_dup_forward_fd(struct conn_manager * cm) {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
 
     if (sock < 0) {
@@ -437,16 +443,21 @@ int conn_manager_set_forwarding(struct conn_manager * cm,
         return -1;
     }
 
-    if (connect(sock, (struct sockaddr *) &addr, sizeof(addr)) != 0) {
+    if (connect(sock, (struct sockaddr *) &cm->forward_addr,
+                sizeof(cm->forward_addr)) != 0) {
         char ip_str[16] = { 0 };
-        inet_ntop(AF_INET, &addr.sin_addr, ip_str, sizeof(ip_str));
+        inet_ntop(AF_INET, &cm->forward_addr.sin_addr, ip_str, sizeof(ip_str));
         fprintf(stderr, "failed to initialize forwarding connection: "
-                "%s:%d, reason %s\n", ip_str, ntohs(addr.sin_port),
+                "%s:%d, reason %s\n", ip_str, ntohs(cm->forward_addr.sin_port),
                 strerror(errno));
         return -1;
     }
 
-    return 0;
+    return sock;
+}
+
+static int conn_manager_has_forward(struct conn_manager * cm) {
+    return *(uint64_t *) &cm->forward_addr.sin_addr != 0;
 }
 
 
@@ -671,28 +682,37 @@ static int read_from(struct conn_manager * cm, struct client * c, int connfd) {
 
     if (from_client) {
         if (c->dstfd == -1) {
-            int req_type;
-            int res = _resolve_host(cm, c, buf, &req_type);
-            if (res == -1) {
-                // TODO buffer this
-                const static char bad_request[] = "HTTP/1.1 400 BAD REQUEST\r\n\r\n";
-                write(c->clientfd, bad_request, sizeof(bad_request) - 1);
-
-                // rearm clientfd for reading in event queue
-                return client_rearm(cm, c);
+            printf("figger\n");
+            if (conn_manager_has_forward(cm)) {
+                c->dstfd = conn_manager_dup_forward_fd(cm);
+                printf("Made %d\n", c->dstfd);
             }
-            c->dstfd = res;
+            else {
+                printf("normal?\n");
+                int req_type;
+                int res = _resolve_host(cm, c, buf, &req_type);
+                if (res == -1) {
+                    // TODO buffer this
+                    const static char bad_request[] = "HTTP/1.1 400 BAD REQUEST\r\n\r\n";
+                    write(c->clientfd, bad_request, sizeof(bad_request) - 1);
 
-            if (req_type == TYPE_CONNECT) {
-                // write OK response
-                // TODO buffer this
-                const static char ok_response[] = "HTTP/1.1 200 OK\r\n\r\n";
-                if (write(c->clientfd, ok_response, sizeof(ok_response) - 1) != sizeof(ok_response) - 1) {
-                    fprintf(stderr, "ERROR: Unable to write back OK response\n");
+                    // rearm clientfd for reading in event queue
+                    return client_rearm(cm, c);
                 }
+                c->dstfd = res;
 
-                // rearm clientfd for reading in event queue
-                return client_rearm(cm, c);
+                if (req_type == TYPE_CONNECT) {
+                    // write OK response
+                    // TODO buffer this
+                    const static char ok_response[] = "HTTP/1.1 200 OK\r\n\r\n";
+                    if (write(c->clientfd, ok_response, sizeof(ok_response) - 1) !=
+                            sizeof(ok_response) - 1) {
+                        fprintf(stderr, "ERROR: Unable to write back OK response\n");
+                    }
+
+                    // rearm clientfd for reading in event queue
+                    return client_rearm(cm, c);
+                }
             }
         }
 
