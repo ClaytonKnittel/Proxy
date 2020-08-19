@@ -274,7 +274,7 @@ int client_rearm(struct conn_manager * cm, struct client * c) {
             .data.ptr = c
         };
 
-        if (epoll_ctl(cm->qfd, EPOLL_CTL_ADD, c->clientfd, &event) < 0) {
+        if (epoll_ctl(cm->qfd, EPOLL_CTL_MOD, c->clientfd, &event) < 0) {
             fprintf(stderr, "Unable to add client read/write fd to epoll, reason: %s\n",
                     strerror(errno));
             close_client(cm, c);
