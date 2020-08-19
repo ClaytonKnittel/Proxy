@@ -36,10 +36,6 @@
 
 #define CLIENT_READ_END_CLOSED 0x1
 #define HOST_READ_END_CLOSED 0x2
-// marked to denote we should send an empty request to host
-#define SEND_EMPTY_TO_HOST 0x4
-// marked to denote we should send an empty response to client
-#define SEND_EMPTY_TO_CLIENT 0x8
 
 #define AWAITING_RESPONSE 0x10
 
@@ -118,8 +114,8 @@ void close_client(struct conn_manager * cm, struct client * c) {
 }
 
 int client_should_close(struct client * c) {
-    return ((c->flags & CLIENT_READ_END_CLOSED) && c->host_buffer_len == 0 && !(c->flags & SEND_EMPTY_TO_HOST)) ||
-           ((c->flags & HOST_READ_END_CLOSED) && c->client_buffer_len == 0 && !(c->flags & SEND_EMPTY_TO_CLIENT));
+    return ((c->flags & CLIENT_READ_END_CLOSED) && c->host_buffer_len == 0) ||
+           ((c->flags & HOST_READ_END_CLOSED) && c->client_buffer_len == 0);
 }
 
 void client_disconnect_client(struct conn_manager * cm, struct client * c) {
@@ -154,43 +150,49 @@ void client_disconnect_host(struct conn_manager * cm, struct client * c) {
 int client_rearm(struct conn_manager * cm, struct client * c) {
     struct kevent ev[4];
 
-    int len = c->dstfd != -1 ? 4 : 2;
+    int len = 0;//c->dstfd != -1 ? 4 : 2;
 
     int client_buffer_full = (c->client_buffer_len + c->client_buffer_offset == sizeof(c->client_buffer));
     int host_buffer_full = (c->host_buffer_len + c->host_buffer_offset == sizeof(c->host_buffer));
 
     int client_buffer_ready = (c->flags & HOST_READ_END_CLOSED) ||
-        (c->client_buffer_len > 0 || (c->flags & SEND_EMPTY_TO_CLIENT));
+        (c->client_buffer_len > 0);
     int host_buffer_ready = (c->flags & CLIENT_READ_END_CLOSED) ||
-        (c->host_buffer_len > 0 || (c->flags & SEND_EMPTY_TO_HOST));
+        (c->host_buffer_len > 0);
 
-    fprintf(stderr, "Rearm client%s%s\n", !host_buffer_full ? " read" : "",
+    /*fprintf(stderr, "Rearm client%s%s\n", !host_buffer_full ? " read" : "",
             client_buffer_ready ? " write" : "");
     if (len == 4) {
         fprintf(stderr, "Rearm host%s%s\n", !client_buffer_full ? " read" : "",
                 host_buffer_ready ? " write" : "");
-    }
+    }*/
 
-    EV_SET(&ev[0], c->clientfd, EVFILT_READ,
-            EV_ADD | (host_buffer_full ? EV_DISABLE : EV_ENABLE) | EV_DISPATCH,
-            NOTE_LOWAT, 0, c);
-    EV_SET(&ev[1], c->clientfd, EVFILT_WRITE,
-            EV_ADD | (client_buffer_ready ? EV_ENABLE : EV_DISABLE) | EV_DISPATCH,
-            NOTE_LOWAT, 0, c);
-    if (len == 4) {
-        EV_SET(&ev[2], c->dstfd, EVFILT_READ,
+    if (c->clientfd != -1) {
+        EV_SET(&ev[0], c->clientfd, EVFILT_READ,
+                EV_ADD | (host_buffer_full ? EV_DISABLE : EV_ENABLE) | EV_DISPATCH,
+                NOTE_LOWAT, 0, c);
+        EV_SET(&ev[1], c->clientfd, EVFILT_WRITE,
+                EV_ADD | (client_buffer_ready ? EV_ENABLE : EV_DISABLE) | EV_DISPATCH,
+                NOTE_LOWAT, 0, c);
+        len += 2;
+    }
+    if (c->dstfd != -1) {
+        EV_SET(&ev[len + 0], c->dstfd, EVFILT_READ,
                 EV_ADD | (client_buffer_full ? EV_DISABLE : EV_ENABLE) | EV_DISPATCH,
                 NOTE_LOWAT, 0, c);
-        EV_SET(&ev[3], c->dstfd, EVFILT_WRITE,
+        EV_SET(&ev[len + 1], c->dstfd, EVFILT_WRITE,
                 EV_ADD | (host_buffer_ready ? EV_ENABLE : EV_DISABLE) | EV_DISPATCH,
                 NOTE_LOWAT, 0, c);
+        len += 2;
     }
 
-    if (kevent(cm->qfd, ev, len, NULL, 0, NULL) == -1) {
-        fprintf(stderr, "Unable to rearm client, reason: %s\n",
-                strerror(errno));
-        close_client(cm, c);
-        return -1;
+    if (len > 0) {
+        if (kevent(cm->qfd, ev, len, NULL, 0, NULL) == -1) {
+            fprintf(stderr, "Unable to rearm client, reason: %s\n",
+                    strerror(errno));
+            close_client(cm, c);
+            return -1;
+        }
     }
     return 0;
 }
@@ -402,11 +404,10 @@ static int _resolve_host(struct conn_manager * cm, struct client * c, char * buf
         port = 80;
     }
 
-    printf("Host: %s\nPort: %d\n", buf, port);
+    //printf("Host: %s\nPort: %d\n", buf, port);
 
     if (strncmp(buf, c->current_host, MAX_HOST) == 0) {
         // we are already connected to this host!
-        printf("Same host \"%s\"\n", c->current_host);
 
         if (colon != NULL) {
             *colon = ':';
@@ -415,7 +416,7 @@ static int _resolve_host(struct conn_manager * cm, struct client * c, char * buf
         return c->dstfd;
     }
     else {
-        printf("Changing host from \"%s\"\n", c->current_host);
+        //printf("Changing host from \"%s\"\n", c->current_host);
         // need to terminate current 
         if (c->dstfd != -1) {
             client_disconnect_host(cm, c);
@@ -455,7 +456,7 @@ static int _resolve_host(struct conn_manager * cm, struct client * c, char * buf
             fprintf(stderr, "failed on %s\n", ip_addr);
             continue;
         }
-        fprintf(stderr, "succeeded on %s\n", ip_addr);
+        //fprintf(stderr, "succeeded on %s\n", ip_addr);
 
         printf("\033[0;92mConnected to host on %d\033[0;39m\n", sock);
         return sock;
@@ -492,26 +493,9 @@ static int read_from(struct conn_manager * cm, struct client * c, int connfd) {
 
     ssize_t n_read = read(connfd, buf, buf_size);
 
-    printf("read %zd from %s\n", n_read, from_client ? "client" : "host");
+    //printf("read %zd from %s\n", n_read, from_client ? "client" : "host");
 
-    if (n_read == -1) {
-        if (n_read == -1) {
-            fprintf(stderr, "Unable to read data from connfd %d, reason: %s\n",
-                    connfd, strerror(errno));
-        }
-        else {
-            fprintf(stderr, "Got empty request, so terminating connection\n");
-        }
-        if (connfd == c->clientfd) {
-            fprintf(stderr, "was client\n");
-        }
-        else {
-            fprintf(stderr, "was host\n");
-        }
-        return -1;
-    }
-
-    if (n_read == 0) {
+    if (n_read <= 0) {
         return client_rearm(cm, c);
     }
 
@@ -534,7 +518,6 @@ static int read_from(struct conn_manager * cm, struct client * c, int connfd) {
             if (req_type == TYPE_CONNECT) {
                 // write OK response
                 // TODO buffer this
-                fprintf(stderr, "Send back OK, we were able to connect\n");
                 const static char ok_response[] = "HTTP/1.1 200 OK\r\n\r\n";
                 if (write(c->clientfd, ok_response, sizeof(ok_response) - 1) != sizeof(ok_response) - 1) {
                     fprintf(stderr, "ERROR: Unable to write back OK response\n");
@@ -548,11 +531,7 @@ static int read_from(struct conn_manager * cm, struct client * c, int connfd) {
         // record data written to buffer
         c->host_buffer_len += n_read;
 
-        printf("read some data, now host buffer len is %llu\n", c->host_buffer_len);
-
-        if (n_read == 0) {
-            c->flags |= SEND_EMPTY_TO_HOST;
-        }
+        //printf("read some data, now host buffer len is %llu\n", c->host_buffer_len);
 
         // forward, unmodified, to destination
         //write(c->dstfd, buf, n_read);
@@ -560,15 +539,10 @@ static int read_from(struct conn_manager * cm, struct client * c, int connfd) {
         return client_rearm(cm, c);
     }
     else {
-        printf("receiving response\n");
 
         c->client_buffer_len += n_read;
 
-        printf("read some data, now client buffer len is %llu\n", c->client_buffer_len);
-
-        if (n_read == 0) {
-            c->flags |= SEND_EMPTY_TO_CLIENT;
-        }
+        //printf("read some data, now client buffer len is %llu\n", c->client_buffer_len);
 
         return client_rearm(cm, c);
     }
@@ -584,13 +558,13 @@ static int write_to(struct conn_manager * cm, struct client * c, int connfd) {
         buf = c->client_buffer + c->client_buffer_offset;
         buf_size = c->client_buffer_len;
 
-        printf("Writing %zu to client\n", buf_size);
+        //printf("Writing %zu to client\n", buf_size);
     }
     else {
         buf = c->host_buffer + c->host_buffer_offset;
         buf_size = c->host_buffer_len;
 
-        printf("Writing %zu to host\n", buf_size);
+        //printf("Writing %zu to host\n", buf_size);
     }
 
     ssize_t n_written = write(connfd, buf, buf_size);
@@ -603,7 +577,6 @@ static int write_to(struct conn_manager * cm, struct client * c, int connfd) {
         else {
             c->client_buffer_offset += n_written;
         }
-        c->flags &= ~SEND_EMPTY_TO_CLIENT;
     }
     else {
         c->host_buffer_len -= n_written;
@@ -613,7 +586,6 @@ static int write_to(struct conn_manager * cm, struct client * c, int connfd) {
         else {
             c->host_buffer_offset += n_written;
         }
-        c->flags &= ~SEND_EMPTY_TO_HOST;
     }
 
     return client_rearm(cm, c);
@@ -659,8 +631,6 @@ void conn_manager_start(struct conn_manager *cm) {
                 read_from(cm, c, fd);
             }
             if (event.flags & EV_EOF) {
-                fprintf(stderr, "socket node shut down, reason: %d\n",
-                        event.fflags);
                 if (c->clientfd == fd) {
                     client_read_end_closed(cm, c);
                 }
