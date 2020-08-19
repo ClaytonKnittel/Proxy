@@ -15,7 +15,7 @@
 #include <get_ip_addr.h>
 
 
-#define MSG_BUF_SIZE 0x100000
+#define MSG_BUF_SIZE 0x1000
 
 #define STR2(x) #x
 #define STR(X) STR2(X)
@@ -34,6 +34,12 @@
 #define TYPE_CONNECT 1
 
 
+#define CLIENT_READ_END_CLOSED 0x1
+// marked to denote we should send an empty request to host
+#define SEND_EMPTY_TO_HOST 0x2
+// marked to denote we should send an empty response to client
+#define SEND_EMPTY_TO_CLIENT 0x4
+
 
 struct client {
     // file descriptor on which requests are received and responses are
@@ -43,31 +49,52 @@ struct client {
     // received
     int dstfd;
 
-    char current_host[MAX_HOST];
+    int flags;
 
     // number of bytes to be received from client
     ssize_t n_bytes_client;
     // number of bytes to be received from dst
     ssize_t n_bytes_dst;
+
+    char current_host[MAX_HOST];
+
+    // client buffer goes to client, host buffer goes to host
+    uint64_t client_buffer_offset;
+    uint64_t client_buffer_len;
+    uint64_t host_buffer_offset;
+    uint64_t host_buffer_len;
+    char __attribute__((aligned(128))) client_buffer[MSG_BUF_SIZE];
+    char __attribute__((aligned(128))) host_buffer[MSG_BUF_SIZE];
 };
 
 
 void client_init(struct client * c) {
     c->clientfd = -1;
     c->dstfd = -1;
+    c->flags = 0;
     c->current_host[0] = '\0';
+    c->client_buffer_offset = 0;
+    c->client_buffer_len = 0;
+    c->host_buffer_offset = 0;
+    c->host_buffer_len = 0;
 }
 
 void close_client(struct conn_manager * cm, struct client * c) {
-    struct kevent ev[2];
-    int len = 1;
-    if (c->dstfd != -1) {
-        EV_SET(&ev[1], c->dstfd, EVFILT_READ,
-                EV_DELETE, 0, 0, 0);
-        len++;
-    }
+    struct kevent ev[4];
+    int len = 2;
+
     EV_SET(&ev[0], c->clientfd, EVFILT_READ,
             EV_DELETE, 0, 0, 0);
+    EV_SET(&ev[1], c->clientfd, EVFILT_WRITE,
+            EV_DELETE, 0, 0, 0);
+
+    if (c->dstfd != -1) {
+        EV_SET(&ev[2], c->dstfd, EVFILT_READ,
+                EV_DELETE, 0, 0, 0);
+        EV_SET(&ev[2], c->dstfd, EVFILT_WRITE,
+                EV_DELETE, 0, 0, 0);
+        len += 2;
+    }
 
     if (kevent(cm->qfd, ev, len, NULL, 0, NULL) == -1) {
         fprintf(stderr, "Unable to delete client, reason: %s\n",
@@ -80,11 +107,17 @@ void close_client(struct conn_manager * cm, struct client * c) {
     free(c);
 }
 
+int client_should_close(struct client * c) {
+    return 0;
+}
+
 void client_disconnect_host(struct conn_manager * cm, struct client * c) {
-    struct kevent ev;
-    EV_SET(&ev, c->dstfd, EVFILT_READ,
+    struct kevent ev[2];
+    EV_SET(&ev[0], c->dstfd, EVFILT_READ,
             EV_DELETE, 0, 0, 0);
-    if (kevent(cm->qfd, &ev, 1, NULL, 0, NULL) == -1) {
+    EV_SET(&ev[1], c->dstfd, EVFILT_WRITE,
+            EV_DELETE, 0, 0, 0);
+    if (kevent(cm->qfd, ev, 2, NULL, 0, NULL) == -1) {
         fprintf(stderr, "Unable to remove dstfd event, reason: %s\n",
                 strerror(errno));
     }
@@ -92,38 +125,53 @@ void client_disconnect_host(struct conn_manager * cm, struct client * c) {
     c->dstfd = -1;
 }
 
-int client_rearm_host(struct conn_manager * cm, struct client * c);
+int client_rearm(struct conn_manager * cm, struct client * c) {
+    struct kevent ev[4];
 
-int client_rearm_client(struct conn_manager * cm, struct client * c) {
-    struct kevent ev;
-    EV_SET(&ev, c->clientfd, EVFILT_READ,
-            EV_ADD | EV_ENABLE | EV_DISPATCH, 0, 0, c);
+    int len = c->dstfd != -1 ? 4 : 2;
 
-    if (kevent(cm->qfd, &ev, 1, NULL, 0, NULL) == -1) {
-        fprintf(stderr, "Unable to arm clientfd, reason: %s\n",
+    int client_buffer_full = (c->flags & CLIENT_READ_END_CLOSED) ||
+        (c->client_buffer_len + c->client_buffer_offset == sizeof(c->client_buffer));
+    int host_buffer_full = (c->host_buffer_len + c->host_buffer_offset == sizeof(c->host_buffer));
+
+    int client_buffer_ready = (c->client_buffer_len > 0 || (c->flags & SEND_EMPTY_TO_CLIENT));
+    int host_buffer_ready = (c->host_buffer_len > 0 || (c->flags & SEND_EMPTY_TO_HOST));
+
+    fprintf(stderr, "Rearm client%s%s\n", !host_buffer_full ? " read" : "",
+            client_buffer_ready ? " write" : "");
+    if (len == 4) {
+        fprintf(stderr, "Rearm host%s%s\n", !client_buffer_full ? " read" : "",
+                host_buffer_ready ? " write" : "");
+    }
+
+    EV_SET(&ev[0], c->clientfd, EVFILT_READ,
+            EV_ADD | (host_buffer_full || (c->flags & CLIENT_READ_END_CLOSED) ? EV_DISABLE : EV_ENABLE) | EV_DISPATCH,
+            NOTE_LOWAT, 0, c);
+    EV_SET(&ev[1], c->clientfd, EVFILT_WRITE,
+            EV_ADD | (client_buffer_ready ? EV_ENABLE : EV_DISABLE) | EV_DISPATCH,
+            NOTE_LOWAT, 0, c);
+    if (len == 4) {
+        EV_SET(&ev[2], c->dstfd, EVFILT_READ,
+                EV_ADD | (client_buffer_full ? EV_DISABLE : EV_ENABLE) | EV_DISPATCH,
+                NOTE_LOWAT, 0, c);
+        EV_SET(&ev[3], c->dstfd, EVFILT_WRITE,
+                EV_ADD | (host_buffer_ready ? EV_ENABLE : EV_DISABLE) | EV_DISPATCH,
+                NOTE_LOWAT, 0, c);
+    }
+
+    if (kevent(cm->qfd, ev, len, NULL, 0, NULL) == -1) {
+        fprintf(stderr, "Unable to rearm client, reason: %s\n",
                 strerror(errno));
-        close(c->clientfd);
-        c->clientfd = -1;
+        close_client(cm, c);
         return -1;
     }
-    client_rearm_host(cm, c);
     return 0;
 }
 
-int client_rearm_host(struct conn_manager * cm, struct client * c) {
-    struct kevent ev;
-    EV_SET(&ev, c->dstfd, EVFILT_READ,
-            EV_ADD | EV_ENABLE | EV_DISPATCH, 0, 0, c);
-
-    if (kevent(cm->qfd, &ev, 1, NULL, 0, NULL) == -1) {
-        fprintf(stderr, "Unable to arm dstfd, reason: %s\n",
-                strerror(errno));
-        close(c->dstfd);
-        c->dstfd = -1;
-        return -1;
-    }
-    return 0;
+void client_read_end_closed(struct client * c) {
+    c->flags |= CLIENT_READ_END_CLOSED;
 }
+
 
 
 
@@ -245,13 +293,15 @@ static int _accept_connection(struct conn_manager *cm) {
     printf("Connected to client of type %x\n",
             sa.sa_family);
 
-    struct kevent ev[2];
+    struct kevent ev[3];
     EV_SET(&ev[0], connfd, EVFILT_READ,
             EV_ADD | EV_DISPATCH, 0, 0, c);
-    EV_SET(&ev[1], cm->listenfd, EVFILT_READ,
+    EV_SET(&ev[1], connfd, EVFILT_WRITE,
+            EV_ADD | EV_DISABLE | EV_DISPATCH, 0, 0, c);
+    EV_SET(&ev[2], cm->listenfd, EVFILT_READ,
             EV_ENABLE | EV_DISPATCH, 0, 0, NULL);
 
-    if (kevent(cm->qfd, ev, 2, NULL, 0, NULL) == -1) {
+    if (kevent(cm->qfd, ev, 3, NULL, 0, NULL) == -1) {
         fprintf(stderr, "Unable to rearm listenfd, reason: %s\n",
                 strerror(errno));
         close(connfd);
@@ -383,13 +433,31 @@ static int _resolve_host(struct conn_manager * cm, struct client * c, char * buf
 
 
 static int read_from(struct conn_manager * cm, struct client * c, int connfd) {
-    char buf[MSG_BUF_SIZE];
+    char * buf;
+    size_t buf_size;
 
-    ssize_t n_read = read(connfd, buf, sizeof(buf));
+    int from_client = (connfd == c->clientfd);
 
-    printf("read %zd\n", n_read);
+    if (from_client) {
+        buf = c->host_buffer + c->host_buffer_offset + c->host_buffer_len;
+        buf_size = MSG_BUF_SIZE - (c->host_buffer_offset + c->host_buffer_len);
+    }
+    else {
+        buf = c->client_buffer + c->client_buffer_offset + c->client_buffer_len;
+        buf_size = MSG_BUF_SIZE - (c->client_buffer_offset + c->client_buffer_len);
+    }
 
-    if (n_read == -1 || n_read == 0) {
+    if (buf_size == 0) {
+        fprintf(stderr, "ERROR: buffer of size 0 was in kqueue for reading\n");
+        client_rearm(cm, c);
+        return -1;
+    }
+
+    ssize_t n_read = read(connfd, buf, buf_size);
+
+    printf("read %zd from %s\n", n_read, from_client ? "client" : "host");
+
+    if (n_read == -1) {
         if (n_read == -1) {
             fprintf(stderr, "Unable to read data from connfd %d, reason: %s\n",
                     connfd, strerror(errno));
@@ -399,63 +467,117 @@ static int read_from(struct conn_manager * cm, struct client * c, int connfd) {
         }
         if (connfd == c->clientfd) {
             fprintf(stderr, "was client\n");
-            close_client(cm, c);
         }
         else {
             fprintf(stderr, "was host\n");
-            client_disconnect_host(cm, c);
-            client_rearm_client(cm, c);
         }
+        close_client(cm, c);
         return -1;
     }
 
-    if (*buf >= 'A' && *buf <= 'Z') {
-        printf("buf: \"%.100s\"\n", buf);
-    }
+    printf("buf: \"%s\"\n", buf);
 
-    //printf("buf: \"%s\"\n", buf);
-
-    if (connfd == c->clientfd) {
+    if (from_client) {
         if (c->dstfd == -1) {
             int req_type;
             int res = _resolve_host(cm, c, buf, &req_type);
             if (res == -1) {
-                fprintf(stderr, "AHH BAD\n");
+                // TODO buffer this
                 const static char bad_request[] = "HTTP/1.1 400 BAD REQUEST\r\n\r\n";
                 write(c->clientfd, bad_request, sizeof(bad_request) - 1);
 
                 // rearm clientfd for reading in event queue
-                return client_rearm_client(cm, c);
+                return client_rearm(cm, c);
             }
             c->dstfd = res;
 
             if (req_type == TYPE_CONNECT) {
                 // write OK response
+                // TODO buffer this
                 fprintf(stderr, "Send back OK, we were able to connect\n");
                 const static char ok_response[] = "HTTP/1.1 200 OK\r\n\r\n";
-                write(c->clientfd, ok_response, sizeof(ok_response) - 1);
+                if (write(c->clientfd, ok_response, sizeof(ok_response) - 1) != sizeof(ok_response) - 1) {
+                    fprintf(stderr, "ERROR: Unable to write back OK response\n");
+                }
 
                 // rearm clientfd for reading in event queue
-                return client_rearm_client(cm, c);
+                return client_rearm(cm, c);
             }
         }
 
-        // forward, unmodified, to destination
-        write(c->dstfd, buf, n_read);
+        // record data written to buffer
+        c->host_buffer_len += n_read;
 
-        // arm dstfd for reading in event queue
-        //return client_rearm_host(cm, c);
-        return client_rearm_client(cm, c);
+        printf("read some data, now host buffer len is %llu\n", c->host_buffer_len);
+
+        if (n_read == 0) {
+            c->flags |= SEND_EMPTY_TO_HOST;
+        }
+
+        // forward, unmodified, to destination
+        //write(c->dstfd, buf, n_read);
+
+        return client_rearm(cm, c);
     }
     else {
-        printf("sending back response\n");
+        printf("receiving response\n");
 
-        // forward to client
-        write(c->clientfd, buf, n_read);
+        c->client_buffer_len += n_read;
 
-        // rearm clientfd for reading in event queue
-        return client_rearm_client(cm, c);
+        printf("read some data, now client buffer len is %llu\n", c->client_buffer_len);
+
+        if (n_read == 0) {
+            c->flags |= SEND_EMPTY_TO_CLIENT;
+        }
+
+        return client_rearm(cm, c);
     }
+}
+
+static int write_to(struct conn_manager * cm, struct client * c, int connfd) {
+    char * buf;
+    size_t buf_size;
+
+    int to_client = connfd == c->clientfd;
+
+    if (to_client) {
+        buf = c->client_buffer + c->client_buffer_offset;
+        buf_size = c->client_buffer_len;
+
+        printf("Writing %zu to client\n", buf_size);
+    }
+    else {
+        buf = c->host_buffer + c->host_buffer_offset;
+        buf_size = c->host_buffer_len;
+
+        printf("Writing %zu to host\n", buf_size);
+    }
+
+    ssize_t n_written = write(connfd, buf, buf_size);
+
+    if (to_client) {
+        c->client_buffer_len -= n_written;
+        if (c->client_buffer_len == 0) {
+            c->client_buffer_offset = 0;
+        }
+        else {
+            c->client_buffer_offset += n_written;
+        }
+        c->flags &= ~SEND_EMPTY_TO_CLIENT;
+    }
+    else {
+        c->host_buffer_len -= n_written;
+        if (c->host_buffer_len == 0) {
+            c->host_buffer_offset = 0;
+        }
+        else {
+            c->host_buffer_offset += n_written;
+        }
+        c->flags &= ~SEND_EMPTY_TO_HOST;
+    }
+
+    return client_rearm(cm, c);
+
 }
 
 
@@ -488,9 +610,24 @@ void conn_manager_start(struct conn_manager *cm) {
             ret = _accept_connection(cm);
         }
         else {
-            // msg from existing connection
             c = event.udata;
-            read_from(cm, c, fd);
+            if (event.filter == EVFILT_WRITE) {
+                write_to(cm, c, fd);
+            }
+            else if (event.filter == EVFILT_READ) {
+                // msg from existing connection
+                read_from(cm, c, fd);
+            }
+            if (event.flags & EV_EOF) {
+                fprintf(stderr, "socket node shut down, reason: %d\n",
+                        event.fflags);
+                client_read_end_closed(c);
+            }
+
+            if (client_should_close(c)) {
+                fprintf(stderr, "Closing client on %d\n", c->clientfd);
+                close_client(cm, c);
+            }
         }
     }
 }
