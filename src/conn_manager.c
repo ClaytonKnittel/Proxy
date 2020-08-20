@@ -72,6 +72,11 @@
 // to the forwarded proxy
 #define CLIENT_IN_LIST 0x20
 
+// set when this client is forwarding connections to this proxy privately,
+// meaning each request should be responded with a new connection initialized
+// on this machine
+#define CLIENT_FORWARDER 0x40
+
 
 
 /*
@@ -628,11 +633,60 @@ int conn_manager_set_private_retrieval(struct conn_manager * cm,
 
     printf("Successfully established private forwarding to this machine\n");
 
+
+    // now designate socket as nonblocking and add to the event queue
+    if (fcntl(sock, F_SETFL, O_NONBLOCK) == -1) {
+        fprintf(stderr, "Unable to set connection to nonblocking, reason: %s\n",
+                strerror(errno));
+        close(sock);
+        return -1;
+    }
+
     cm->flags |= PRIVATE_RETRIEVAL;
     __builtin_memcpy(&cm->r_addr, &in, sizeof(struct sockaddr_in));
     cm->r_addr_fd = sock;
 
+    struct client * c = (struct client *) malloc(sizeof(struct client));
+    client_init(c);
+    c->clientfd = sock;
+    // will always stay -1
+    c->dstfd = -1;
+    // set forwarding flag in this client struct so we know to expect only
+    // connection request messages
+    c->flags |= CLIENT_FORWARDER;
+
     free(passwd);
+    return 0;
+}
+
+/*
+ * initialize connection to the given client
+ */
+static int _initialize_connection_to(struct conn_manager * cm, struct client * c) {
+
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        fprintf(stderr, "Failed to initialize socket, reason: %s\n",
+                strerror(errno));
+        client_rearm(cm, c);
+        return -1;
+    }
+
+    if (connect(sock, (struct sockaddr *) &cm->r_addr, sizeof(cm->r_addr)) != 0) {
+        fprintf(stderr, "Failed to etablish connection with reverse fowrard, "
+                "reason: %s\n", strerror(errno));
+        client_rearm(cm, c);
+        return -1;
+    }
+
+    struct client * c2 = (struct client *) malloc(sizeof(struct client));
+    client_init(c2);
+    c2->clientfd = sock;
+    // will initialize later
+    c2->dstfd = -1;
+
+    client_rearm(cm, c);
+    client_rearm(cm, c2);
     return 0;
 }
 
@@ -1041,8 +1095,15 @@ void conn_manager_start(struct conn_manager *cm) {
                     event.events & EPOLLIN
 #endif
                     ) {
-                // msg from existing connection
-                read_from(cm, c, fd);
+                if (c->flags & CLIENT_FORWARDER) {
+                    // this is the proxy forwarding to us, we should respond by
+                    // establishing a new connection
+                    _initialize_connection_to(cm, c);
+                }
+                else {
+                    // msg from existing connection
+                    read_from(cm, c, fd);
+                }
             }
             if (
 #ifdef __APPLE__
