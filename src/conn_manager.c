@@ -1155,7 +1155,7 @@ static void _print_proxy_info(struct conn_manager *cm) {
 
     port = ntohs(cm->in.sin_port);
 
-    printf("Proxy listening on port: %s:%d\n", get_ip_addr_str(), port);
+    fprintf(stdout, "Proxy listening on port: %s:%d\n", get_ip_addr_str(), port);
 }
 
 
