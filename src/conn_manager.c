@@ -80,6 +80,12 @@
 #define CLIENT_AWAITING_FORWARD 0x80
 
 
+#ifndef DEBUG
+// don't print to stdout if not in debug mode
+#define printf(...)
+#endif
+
+
 
 /*
  * write n_bytes from buffer onto c's write queue
@@ -237,7 +243,7 @@ void client_disconnect_host(struct conn_manager * cm, struct client * c) {
                 strerror(errno));
     }
 #endif
-    fprintf(stderr, "\033[0;91mdisconnect host on %d the weird way\033[0;39m\n", c->dstfd);
+    printf("\033[0;91mdisconnect host on %d the weird way\033[0;39m\n", c->dstfd);
     close(c->dstfd);
     c->dstfd = -1;
 }
@@ -347,13 +353,13 @@ int client_rearm(struct conn_manager * cm, struct client * c) {
 
 
 void host_read_end_closed(struct conn_manager * cm, struct client * c) {
-    fprintf(stderr, "\033[0;91mdisconnect host on %d\033[0;39m\n", c->dstfd);
+    printf("\033[0;91mdisconnect host on %d\033[0;39m\n", c->dstfd);
     client_disconnect_host(cm, c);
     c->flags |= HOST_READ_END_CLOSED;
 }
 
 void client_read_end_closed(struct conn_manager * cm, struct client * c) {
-    fprintf(stderr, "\033[0;31mdisconnect client on %d\033[0;39m\n", c->clientfd);
+    printf("\033[0;31mdisconnect client on %d\033[0;39m\n", c->clientfd);
     client_disconnect_client(cm, c);
     c->flags |= CLIENT_READ_END_CLOSED;
 }
@@ -457,11 +463,11 @@ static int is_private_connection(struct conn_manager * cm, int connfd) {
 
     char ip_str[16] = { 0 };
     inet_ntop(AF_INET, &cm->pf_addr.sin_addr, ip_str, sizeof(ip_str));
-    fprintf(stderr, "private forward on %s:%d\n", ip_str,
+    printf("private forward on %s:%d\n", ip_str,
             ntohs(cm->pf_addr.sin_port));
 
     inet_ntop(AF_INET, &addr.sin_addr, ip_str, sizeof(ip_str));
-    fprintf(stderr, "request on %s:%d\n", ip_str,
+    printf("request on %s:%d\n", ip_str,
             ntohs(addr.sin_port));
 
     return __builtin_memcmp(&addr.sin_addr, &cm->pf_addr.sin_addr, sizeof(struct in_addr)) == 0;
@@ -921,7 +927,7 @@ static int _resolve_host(struct conn_manager * cm, struct client * c,
     h = gethostbyname(buf);
 
     if (h == NULL) {
-        fprintf(stderr, "Unable to resolve host \"%s\"\n", buf);
+        printf("Unable to resolve host \"%s\"\n", buf);
 
         if (colon != NULL) {
             *colon = ':';
@@ -1062,7 +1068,6 @@ static int read_from(struct conn_manager * cm, struct client * c, int connfd) {
             return client_rearm(cm, c);
         }
         else {
-            printf("regular\n");
             int req_type;
             int res = _resolve_host(cm, c, buf, &req_type);
             if (res == -1) {
@@ -1077,7 +1082,6 @@ static int read_from(struct conn_manager * cm, struct client * c, int connfd) {
             c->dstfd = res;
 
             if (req_type == TYPE_CONNECT) {
-                printf("was CONNECT request\n");
                 // write OK response
                 const static char ok_response[] = "HTTP/1.1 200 OK\r\n\r\n";
                 return put_bytes(cm, c, c->dstfd, ok_response, sizeof(ok_response) - 1);
@@ -1235,7 +1239,7 @@ void conn_manager_start(struct conn_manager *cm) {
             }
 
             if (client_should_close(c)) {
-                fprintf(stderr, "\033[0;31mClosing client on (%d, %d)\033[0;39m\n", c->clientfd, c->dstfd);
+                printf("\033[0;31mClosing client on (%d, %d)\033[0;39m\n", c->clientfd, c->dstfd);
                 close_client(cm, c);
             }
         }
