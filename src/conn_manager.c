@@ -249,24 +249,27 @@ int client_rearm(struct conn_manager * cm, struct client * c) {
 #ifdef __APPLE__
     struct kevent ev[4];
 
-    int len = 0;//c->dstfd != -1 ? 4 : 2;
+    int len = 0;
 #endif
 
     int client_buffer_full = (c->client_buffer_len + c->client_buffer_offset == sizeof(c->client_buffer));
     int host_buffer_full = (c->host_buffer_len + c->host_buffer_offset == sizeof(c->host_buffer));
 
     // FIXME double check this l8tr
-    int client_buffer_ready = !(c->flags & CLIENT_READ_END_CLOSED) &&
-        (c->client_buffer_len > 0);
-    int host_buffer_ready = !(c->flags & HOST_READ_END_CLOSED) &&
+    int client_buffer_ready = !(c->flags & CLIENT_AWAITING_FORWARD) &&
+        ((c->flags & CLIENT_READ_END_CLOSED) ||
+         (c->client_buffer_len > 0));
+    int host_buffer_ready = (c->flags & HOST_READ_END_CLOSED) ||
         (c->host_buffer_len > 0);
 
-    /*fprintf(stderr, "Rearm client%s%s\n", !host_buffer_full ? " read" : "",
-            client_buffer_ready ? " write" : "");
-    if (len == 4) {
+    if (c->clientfd != -1) {
+        fprintf(stderr, "Rearm client%s%s\n", !host_buffer_full ? " read" : "",
+                client_buffer_ready ? " write" : "");
+    }
+    if (c->dstfd != -1) {
         fprintf(stderr, "Rearm host%s%s\n", !client_buffer_full ? " read" : "",
                 host_buffer_ready ? " write" : "");
-    }*/
+    }
 
 #ifdef __APPLE__
 
@@ -405,6 +408,8 @@ static int designate_private_forward(struct conn_manager * cm,
 
     socklen_t len = sizeof(cm->pf_addr);
 
+    __builtin_memset(&cm->pf_addr, 0, sizeof(cm->pf_addr));
+
     if (getpeername(c->clientfd, (struct sockaddr *) &cm->pf_addr, &len) < 0) {
         fprintf(stderr, "Unable to get peer name of private forward, reason: %s\n",
                 strerror(errno));
@@ -424,8 +429,6 @@ static int designate_private_forward(struct conn_manager * cm,
     cm->flags |= PRIVATE_FORWARDING;
     cm->private_forward = c;
     client_list_init(cm);
-
-    __builtin_memset(&cm->pf_addr, 0, sizeof(cm->pf_addr));
 
     return 0;
 }
@@ -454,7 +457,16 @@ static int is_private_connection(struct conn_manager * cm, int connfd) {
         return 0;
     }
 
-    return __builtin_memcmp(&addr, &cm->pf_addr, sizeof(struct sockaddr_in)) == 0;
+    char ip_str[16] = { 0 };
+    inet_ntop(AF_INET, &cm->pf_addr.sin_addr, ip_str, sizeof(ip_str));
+    fprintf(stderr, "private forward on %s:%d\n", ip_str,
+            ntohs(cm->pf_addr.sin_port));
+
+    inet_ntop(AF_INET, &addr.sin_addr, ip_str, sizeof(ip_str));
+    fprintf(stderr, "request on %s:%d\n", ip_str,
+            ntohs(addr.sin_port));
+
+    return __builtin_memcmp(&addr.sin_addr, &cm->pf_addr.sin_addr, sizeof(struct in_addr)) == 0;
 }
 
 static void delegate_private_connection(struct conn_manager * cm, int connfd) {
@@ -942,7 +954,6 @@ static int put_bytes(struct conn_manager * cm, struct client * c, int connfd,
     int from_client = (connfd == c->clientfd);
 
     if (from_client) {
-        assert(c->dstfd != -1);
 
         // record data written to buffer
         c->host_buffer_len += n_bytes;
@@ -999,8 +1010,6 @@ static int read_from(struct conn_manager * cm, struct client * c, int connfd) {
         else if (has_private_forward(cm)) {
             printf("%d requests private forward\n", connfd);
             request_dup_private_forward(cm, c);
-            // don't rearm until we get a response
-            return 0;
         }
         else if (is_requesting_private_forward(buf, buf_size)) {
             printf("designating\n");
