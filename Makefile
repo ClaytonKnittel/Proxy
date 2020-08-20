@@ -10,6 +10,8 @@ SRC=$(shell find $(SDIR) -type f -name '*.c')
 OBJ=$(patsubst $(SDIR)/%.c,$(ODIR)/%.o,$(SRC))
 DEP=$(wildcard $(SDIR)/*.h)
 
+ASM=$(shell find $(SDIR) -type f -name '*.S')
+
 DIRS=$(shell find $(SDIR) -type d)
 OBJDIRS=$(patsubst $(SDIR)/%,$(ODIR)/%,$(DIRS))
 
@@ -29,7 +31,7 @@ tests:
 
 
 $(EXE): $(OBJ)
-	$(CC) $(CFLAGS) $^ -o $@ $(LDFALGS)
+	$(CC) $(CFLAGS) $^ $(ASM) -o $@ $(LDFALGS)
 
 
 $(ODIR)/%.o: $(SDIR)/%.c

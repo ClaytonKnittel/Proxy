@@ -22,6 +22,7 @@
 
 #include <conn_manager.h>
 #include <get_ip_addr.h>
+#include <random.h>
 
 
 #define MSG_BUF_SIZE 0x1000
@@ -63,6 +64,23 @@
 #define HOST_IN_QUEUE 0x10
 
 
+// if this message is sent over a socket, it is expected to be requesting
+// itself as a private forwarding connection
+#define MAGIC_STRING "onaVcyTQLx93slLFZsacAdrFigoQ10Yp"
+
+// set when the client struct is waiting to be matched with a private connection
+// to the forwarded proxy
+#define CLIENT_IN_LIST 0x20
+
+
+
+/*
+ * write n_bytes from buffer onto c's write queue
+ */
+static int put_bytes(struct conn_manager * cm, struct client * c, int connfd,
+        const char * buf, ssize_t n_bytes);
+
+
 struct client {
     // file descriptor on which requests are received and responses are
     // forwarded
@@ -80,6 +98,11 @@ struct client {
 
     char current_host[MAX_HOST];
 
+    // singly linked list of client objects that are waiting to be connected
+    // to a private forwarded proxy (only used when being forwarded to private
+    // proxy)
+    struct client * next;
+
     // client buffer goes to client, host buffer goes to host
     uint64_t client_buffer_offset;
     uint64_t client_buffer_len;
@@ -95,6 +118,7 @@ void client_init(struct client * c) {
     c->dstfd = -1;
     c->flags = 0;
     c->current_host[0] = '\0';
+    c->next = NULL;
     c->client_buffer_offset = 0;
     c->client_buffer_len = 0;
     c->host_buffer_offset = 0;
@@ -323,6 +347,91 @@ void client_read_end_closed(struct conn_manager * cm, struct client * c) {
 }
 
 
+static int has_private_forward(struct conn_manager * cm) {
+    return (cm->flags & PRIVATE_FORWARDING) != 0;
+}
+
+
+static int is_requesting_private_forward(const char * buf, ssize_t buf_len) {
+    return buf_len >= sizeof(MAGIC_STRING) - 1 &&
+        __builtin_memcmp(buf, MAGIC_STRING, sizeof(MAGIC_STRING) - 1) == 0;
+}
+
+
+static int designate_private_forward(struct conn_manager * cm,
+        struct client * c) {
+
+    socklen_t len = sizeof(cm->pf_addr);
+
+    if (getpeername(c->clientfd, (struct sockaddr *) &cm->pf_addr, &len) < 0) {
+        fprintf(stderr, "Unable to get peer name of private forward, reason: %s\n",
+                strerror(errno));
+        return -1;
+    }
+    printf("Peer's IP address is: %s\n", inet_ntoa(cm->pf_addr.sin_addr));
+    printf("Peer's port is: %d\n", (int) ntohs(cm->pf_addr.sin_port));
+
+    // let them know we have chosen them to be a private forward
+    char affirmative[] = MAGIC_STRING;
+    if (write(c->clientfd, affirmative, sizeof(affirmative) - 1) <
+            sizeof(affirmative) - 1) {
+        fprintf(stderr, "Unable to affirm private forward of role, aborting\n");
+        return -1;
+    }
+
+    cm->flags |= PRIVATE_FORWARDING;
+    cm->private_forward = c;
+
+    cm->client_list = NULL;
+
+    __builtin_memset(&cm->pf_addr, 0, sizeof(cm->pf_addr));
+
+    return 0;
+}
+
+
+static void request_dup_private_forward(struct conn_manager * cm,
+        struct client * c) {
+    const static char buf[] = "please give me another private connection";
+    // put bytes to private_forward->dstfd = -1, so it appears as though
+    // they are being received by the nonexistent host and should be relayed
+    // back
+    put_bytes(cm, cm->private_forward, -1, buf, sizeof(buf) - 1);
+}
+
+static int is_private_connection(struct conn_manager * cm, int connfd) {
+    struct sockaddr_in addr;
+
+    __builtin_memset(&addr, 0, sizeof(addr));
+
+    socklen_t len = sizeof(addr);
+
+    if (getpeername(connfd, (struct sockaddr *) &addr, &len) < 0) {
+        fprintf(stderr, "Unable to check peer name, reason: %s\n", strerror(errno));
+        return 0;
+    }
+
+    return __builtin_memcmp(&addr, &cm->pf_addr, sizeof(struct sockaddr_in)) == 0;
+}
+
+static void delegate_private_connection(struct conn_manager * cm, int connfd) {
+    struct client * next = cm->client_list;
+
+    if (next == NULL) {
+        printf("nobody in queue, forward %d closing\n", connfd);
+        close(connfd);
+    }
+    else {
+        printf("Giving private forward (%d) to %d\n", connfd, next->clientfd);
+        cm->client_list = next->next;
+        next->next = NULL;
+        next->flags &= !CLIENT_IN_LIST;
+        next->dstfd = connfd;
+        client_rearm(cm, next);
+    }
+}
+
+
 
 
 static int _connect(struct conn_manager *cm) {
@@ -355,11 +464,14 @@ static void _print_ipv4(struct sockaddr *s) {
 
 
 
-int conn_manager_init(struct conn_manager *cm, int rec_port, int send_port) {
+int conn_manager_init(struct conn_manager *cm, int rec_port) {
     int sock, q;
 #ifdef __APPLE__
     struct kevent e;
 #endif
+
+    uint64_t t = time(NULL);
+    seed_rand(t, t * t);
 
     __builtin_memset(&cm->in, 0, sizeof(cm->in));
 
@@ -390,6 +502,8 @@ int conn_manager_init(struct conn_manager *cm, int rec_port, int send_port) {
     cm->listenfd = sock;
 
     cm->backlog = 16;
+
+    cm->flags = 0;
 
     cm->qfd = q;
 
@@ -430,6 +544,8 @@ int conn_manager_init(struct conn_manager *cm, int rec_port, int send_port) {
 int conn_manager_set_forwarding(struct conn_manager * cm,
         struct sockaddr_in addr) {
 
+    printf("set forwarding\n");
+    cm->flags |= FORWARDING;
     __builtin_memcpy(&cm->forward_addr, &addr, sizeof(struct sockaddr_in));
 
     return 0;
@@ -457,7 +573,67 @@ static int conn_manager_dup_forward_fd(struct conn_manager * cm) {
 }
 
 static int conn_manager_has_forward(struct conn_manager * cm) {
-    return *(uint64_t *) &cm->forward_addr.sin_addr != 0;
+    return (cm->flags & FORWARDING) != 0;
+}
+
+
+
+int conn_manager_set_private_retrieval(struct conn_manager * cm,
+        struct sockaddr_in in) {
+
+    // get password
+    char * input = getpass("Enter proxy password: ");
+
+    size_t len = strlen(input);
+    char * passwd = (char *) malloc(len);
+    memcpy(passwd, input, len * sizeof(char));
+
+    input = getpass("Enter proxy password again: ");
+
+    printf("\"%s\", \"%s\"\n", passwd, input);
+
+    if (strncmp(passwd, input, len) != 0) {
+        fprintf(stderr, "Passwords do not match!\n");
+        return -1;
+    }
+
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+
+    if (sock < 0) {
+        fprintf(stderr, "Unable to create socket, reason: %s\n",
+                strerror(errno));
+        return -1;
+    }
+
+    if (connect(sock, (struct sockaddr *) &in, sizeof(in)) != 0) {
+        char ip_str[16] = { 0 };
+        inet_ntop(AF_INET, &in.sin_addr, ip_str, sizeof(ip_str));
+        fprintf(stderr, "Failed to connect to forwarding proxy on %s:%d, "
+                "reason: %s\n", ip_str, ntohs(in.sin_port), strerror(errno));
+        close(sock);
+        return -1;
+    }
+
+    // attempt to establish self as the private forwarding proxy
+    const static char msg[] = MAGIC_STRING;
+    write(sock, msg, sizeof(msg) - 1);
+
+    // blocking wait for response
+    char response[sizeof(MAGIC_STRING) - 1];
+    if (read(sock, response, sizeof(response)) < sizeof(response)) {
+        fprintf(stderr, "Could not establish private forwarding, aborting\n");
+        close(sock);
+        return -1;
+    }
+
+    printf("Successfully established private forwarding to this machine\n");
+
+    cm->flags |= PRIVATE_RETRIEVAL;
+    __builtin_memcpy(&cm->r_addr, &in, sizeof(struct sockaddr_in));
+    cm->r_addr_fd = sock;
+
+    free(passwd);
+    return 0;
 }
 
 
@@ -491,6 +667,11 @@ static int _accept_connection(struct conn_manager *cm) {
         return -1;
     }
 
+    if (has_private_forward(cm) && is_private_connection(cm, connfd)) {
+        delegate_private_connection(cm, connfd);
+        return 0;
+    }
+
     c = (struct client *) malloc(sizeof(struct client));
     client_init(c);
     c->clientfd = connfd;
@@ -508,15 +689,16 @@ static int _accept_connection(struct conn_manager *cm) {
     EV_SET(&ev[2], cm->listenfd, EVFILT_READ,
             EV_ENABLE | EV_DISPATCH, 0, 0, NULL);
 
-    if (kevent(cm->qfd, ev, 3, NULL, 0, NULL) == -1) {
+    if (kevent(cm->qfd, ev, 3, NULL, 0, NULL) == -1)
 #elif __linux__
     struct epoll_event read_event = {
         .events = EPOLLIN | EPOLLRDHUP | EPOLLONESHOT,
         .data.ptr = c
     };
 
-    if (epoll_ctl(cm->qfd, EPOLL_CTL_ADD, connfd, &read_event) < 0) {
+    if (epoll_ctl(cm->qfd, EPOLL_CTL_ADD, connfd, &read_event) < 0)
 #endif
+    {
         fprintf(stderr, "Unable to rearm listenfd, reason: %s\n",
                 strerror(errno));
         close(connfd);
@@ -528,7 +710,8 @@ static int _accept_connection(struct conn_manager *cm) {
 }
 
 
-static int _resolve_host(struct conn_manager * cm, struct client * c, char * buf, int * req_type) {
+static int _resolve_host(struct conn_manager * cm, struct client * c,
+        const char * buf, int * req_type) {
     int port;
 
     struct hostent * h;
@@ -571,7 +754,8 @@ static int _resolve_host(struct conn_manager * cm, struct client * c, char * buf
         // port follows
         port = (int) strtoul(colon + 1, &end, 10);
         if (*(colon + 1) == '\0' || *end != '\0') {
-            fprintf(stderr, "Unable to convert port \"%*s\" to unsigned long\n", (int) (end - colon + 1), colon + 1);
+            fprintf(stderr, "Unable to convert port \"%*s\" to unsigned long\n",
+                    (int) (end - colon + 1), colon + 1);
             *end = prior;
             return -1;
         }
@@ -649,41 +833,27 @@ static int _resolve_host(struct conn_manager * cm, struct client * c, char * buf
 }
 
 
-static int read_from(struct conn_manager * cm, struct client * c, int connfd) {
-    char * buf;
-    size_t buf_size;
+
+static int put_bytes(struct conn_manager * cm, struct client * c, int connfd,
+        const char * buf, ssize_t n_bytes) {
 
     int from_client = (connfd == c->clientfd);
-
-    if (from_client) {
-        buf = c->host_buffer + c->host_buffer_offset + c->host_buffer_len;
-        buf_size = MSG_BUF_SIZE - (c->host_buffer_offset + c->host_buffer_len);
-    }
-    else {
-        buf = c->client_buffer + c->client_buffer_offset + c->client_buffer_len;
-        buf_size = MSG_BUF_SIZE - (c->client_buffer_offset + c->client_buffer_len);
-    }
-
-    if (buf_size == 0) {
-        fprintf(stderr, "ERROR: buffer of size 0 was in kqueue for reading\n");
-        client_rearm(cm, c);
-        return -1;
-    }
-
-    ssize_t n_read = read(connfd, buf, buf_size);
-
-    //printf("read %zd from %s\n", n_read, from_client ? "client" : "host");
-
-    if (n_read <= 0) {
-        return client_rearm(cm, c);
-    }
-
-    //printf("buf: \"%s\"\n", buf);
 
     if (from_client) {
         if (c->dstfd == -1) {
             if (conn_manager_has_forward(cm)) {
                 c->dstfd = conn_manager_dup_forward_fd(cm);
+            }
+            else if (has_private_forward(cm)) {
+                printf("%d requests private forward\n", connfd);
+                request_dup_private_forward(cm, c);
+                // don't rearm until we get a response
+                return 0;
+            }
+            else if (is_requesting_private_forward(buf, n_bytes)) {
+                printf("designating\n");
+                designate_private_forward(cm, c);
+                return client_rearm(cm, c);
             }
             else {
                 int req_type;
@@ -714,7 +884,7 @@ static int read_from(struct conn_manager * cm, struct client * c, int connfd) {
         }
 
         // record data written to buffer
-        c->host_buffer_len += n_read;
+        c->host_buffer_len += n_bytes;
 
         //printf("read some data, now host buffer len is %llu\n", c->host_buffer_len);
 
@@ -722,12 +892,46 @@ static int read_from(struct conn_manager * cm, struct client * c, int connfd) {
     }
     else {
 
-        c->client_buffer_len += n_read;
+        c->client_buffer_len += n_bytes;
 
         //printf("read some data, now client buffer len is %llu\n", c->client_buffer_len);
 
         return client_rearm(cm, c);
     }
+}
+
+
+static int read_from(struct conn_manager * cm, struct client * c, int connfd) {
+    char * buf;
+    size_t buf_size;
+
+    int from_client = (connfd == c->clientfd);
+
+    if (from_client) {
+        buf = c->host_buffer + c->host_buffer_offset + c->host_buffer_len;
+        buf_size = MSG_BUF_SIZE - (c->host_buffer_offset + c->host_buffer_len);
+    }
+    else {
+        buf = c->client_buffer + c->client_buffer_offset + c->client_buffer_len;
+        buf_size = MSG_BUF_SIZE - (c->client_buffer_offset + c->client_buffer_len);
+    }
+
+    if (buf_size == 0) {
+        fprintf(stderr, "ERROR: buffer of size 0 was in kqueue for reading\n");
+        client_rearm(cm, c);
+        return -1;
+    }
+
+    ssize_t n_read = read(connfd, buf, buf_size);
+
+    //printf("read %zd from %s\n", n_read, from_client ? "client" : "host");
+
+    if (n_read <= 0) {
+        return client_rearm(cm, c);
+    }
+
+    //printf("buf: \"%s\"\n", buf);
+    return put_bytes(cm, c, connfd, buf, n_read);
 }
 
 static int write_to(struct conn_manager * cm, struct client * c, int connfd) {
@@ -818,7 +1022,7 @@ void conn_manager_start(struct conn_manager *cm) {
 
         if (fd == cm->listenfd) {
             // incoming connection to new client
-            ret = _accept_connection(cm);
+            _accept_connection(cm);
         }
         else {
             if (
