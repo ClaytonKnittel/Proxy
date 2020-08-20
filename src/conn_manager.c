@@ -69,10 +69,6 @@
 // itself as a private forwarding connection
 #define MAGIC_STRING "onaVcyTQLx93slLFZsacAdrFigoQ10Yp"
 
-// set when the client struct is waiting to be matched with a private connection
-// to the forwarded proxy
-#define CLIENT_IN_LIST 0x20
-
 // set when this client is forwarding connections to this proxy privately,
 // meaning each request should be responded with a new connection initialized
 // on this machine
@@ -262,6 +258,7 @@ int client_rearm(struct conn_manager * cm, struct client * c) {
     int host_buffer_ready = (c->flags & HOST_READ_END_CLOSED) ||
         (c->host_buffer_len > 0);
 
+    /*
     if (c->clientfd != -1) {
         fprintf(stderr, "Rearm client%s%s\n", !host_buffer_full ? " read" : "",
                 client_buffer_ready ? " write" : "");
@@ -269,7 +266,7 @@ int client_rearm(struct conn_manager * cm, struct client * c) {
     if (c->dstfd != -1) {
         fprintf(stderr, "Rearm host%s%s\n", !client_buffer_full ? " read" : "",
                 host_buffer_ready ? " write" : "");
-    }
+    }*/
 
 #ifdef __APPLE__
 
@@ -479,7 +476,7 @@ static void delegate_private_connection(struct conn_manager * cm, int connfd) {
     else {
         printf("Giving private forward (%d) to %d\n", connfd, next->clientfd);
         next->next = NULL;
-        next->flags &= !CLIENT_IN_LIST;
+        next->flags &= ~CLIENT_AWAITING_FORWARD;
         next->dstfd = connfd;
         client_rearm(cm, next);
     }
@@ -761,6 +758,22 @@ void conn_manager_close(struct conn_manager *cm) {
 }
 
 
+static int rearm_listenfd(struct conn_manager * cm) {
+#ifdef __APPLE__
+    struct kevent ev;
+    EV_SET(&ev, cm->listenfd, EVFILT_READ,
+            EV_ENABLE | EV_DISPATCH, 0, 0, NULL);
+
+    if (kevent(cm->qfd, &ev, 1, NULL, 0, NULL) == -1) {
+        fprintf(stderr, "Unable to rearm listenfd, reason: %s\n",
+                strerror(errno));
+        return -1;
+    }
+#endif
+    return 0;
+}
+
+
 static int _accept_connection(struct conn_manager *cm) {
     struct sockaddr sa;
     socklen_t len = sizeof(sa);
@@ -771,6 +784,7 @@ static int _accept_connection(struct conn_manager *cm) {
     if (connfd == -1) {
         fprintf(stderr, "Unable to accept client, reason: %s\n",
                 strerror(errno));
+        rearm_listenfd(cm);
         return -1;
     }
 
@@ -778,11 +792,13 @@ static int _accept_connection(struct conn_manager *cm) {
         fprintf(stderr, "Unable to set connection to nonblocking, reason: %s\n",
                 strerror(errno));
         close(connfd);
+        rearm_listenfd(cm);
         return -1;
     }
 
     if (has_private_forward(cm) && is_private_connection(cm, connfd)) {
         delegate_private_connection(cm, connfd);
+        rearm_listenfd(cm);
         return 0;
     }
 
@@ -948,8 +964,8 @@ static int _resolve_host(struct conn_manager * cm, struct client * c,
 
 
 
-static int put_bytes(struct conn_manager * cm, struct client * c, int connfd,
-        const char * buf, ssize_t n_bytes) {
+static int register_bytes(struct conn_manager * cm, struct client * c, int connfd,
+        ssize_t n_bytes) {
 
     int from_client = (connfd == c->clientfd);
 
@@ -970,6 +986,34 @@ static int put_bytes(struct conn_manager * cm, struct client * c, int connfd,
 
         return client_rearm(cm, c);
     }
+}
+
+static int put_bytes(struct conn_manager * cm, struct client * c, int srcfd,
+        const char * buf, ssize_t n_bytes) {
+
+    char * dst_buf;
+    ssize_t dst_buf_size;
+
+    int from_client = (srcfd == c->clientfd);
+
+    if (from_client) {
+        dst_buf = c->host_buffer + c->host_buffer_offset + c->host_buffer_len;
+        dst_buf_size = MSG_BUF_SIZE - (c->host_buffer_offset + c->host_buffer_len);
+    }
+    else {
+        dst_buf = c->client_buffer + c->client_buffer_offset + c->client_buffer_len;
+        dst_buf_size = MSG_BUF_SIZE - (c->client_buffer_offset + c->client_buffer_len);
+    }
+
+    if (dst_buf_size < n_bytes) {
+        fprintf(stderr, "Could not write \"%*s\" to buffer, not enough space\n",
+                (int) n_bytes, buf);
+        return -1;
+    }
+
+    memcpy(dst_buf, buf, n_bytes);
+
+    return register_bytes(cm, c, srcfd, n_bytes);
 }
 
 
@@ -1021,32 +1065,35 @@ static int read_from(struct conn_manager * cm, struct client * c, int connfd) {
             int req_type;
             int res = _resolve_host(cm, c, buf, &req_type);
             if (res == -1) {
-                // TODO buffer this
                 const static char bad_request[] = "HTTP/1.1 400 BAD REQUEST\r\n\r\n";
+                return put_bytes(cm, c, -1, bad_request, sizeof(bad_request) - 1);
+                /*
                 write(c->clientfd, bad_request, sizeof(bad_request) - 1);
 
                 // rearm clientfd for reading in event queue
-                return client_rearm(cm, c);
+                return client_rearm(cm, c);*/
             }
             c->dstfd = res;
 
             if (req_type == TYPE_CONNECT) {
+                printf("was CONNECT request\n");
                 // write OK response
-                // TODO buffer this
                 const static char ok_response[] = "HTTP/1.1 200 OK\r\n\r\n";
+                return put_bytes(cm, c, c->dstfd, ok_response, sizeof(ok_response) - 1);
+                /*
                 if (write(c->clientfd, ok_response, sizeof(ok_response) - 1) !=
                         sizeof(ok_response) - 1) {
                     fprintf(stderr, "ERROR: Unable to write back OK response\n");
                 }
 
                 // rearm clientfd for reading in event queue
-                return client_rearm(cm, c);
+                return client_rearm(cm, c);*/
             }
         }
     }
 
     //printf("buf: \"%s\"\n", buf);
-    return put_bytes(cm, c, connfd, buf, n_read);
+    return register_bytes(cm, c, connfd, n_read);
 }
 
 static int write_to(struct conn_manager * cm, struct client * c, int connfd) {
@@ -1060,12 +1107,16 @@ static int write_to(struct conn_manager * cm, struct client * c, int connfd) {
         buf_size = c->client_buffer_len;
 
         //printf("Writing %zu to client\n", buf_size);
+        printf("To client:\n\033[0;37m%*s\033[0;39m\n", (int) buf_size,
+                buf);
     }
     else {
         buf = c->host_buffer + c->host_buffer_offset;
         buf_size = c->host_buffer_len;
 
         //printf("Writing %zu to host\n", buf_size);
+        printf("To host:\n\033[0;36m%*s\033[0;39m\n", (int) buf_size,
+                buf);
     }
 
     ssize_t n_written = write(connfd, buf, buf_size);
