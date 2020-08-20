@@ -1108,16 +1108,16 @@ static int write_to(struct conn_manager * cm, struct client * c, int connfd) {
         buf_size = c->client_buffer_len;
 
         //printf("Writing %zu to client\n", buf_size);
-        printf("To client:\n\033[0;37m%*s\033[0;39m\n", (int) buf_size,
-                buf);
+        /*printf("To client:\n\033[0;37m%*s\033[0;39m\n", (int) buf_size,
+                buf);*/
     }
     else {
         buf = c->host_buffer + c->host_buffer_offset;
         buf_size = c->host_buffer_len;
 
         //printf("Writing %zu to host\n", buf_size);
-        printf("To host:\n\033[0;36m%*s\033[0;39m\n", (int) buf_size,
-                buf);
+        /*printf("To host:\n\033[0;36m%*s\033[0;39m\n", (int) buf_size,
+                buf);*/
     }
 
     ssize_t n_written = write(connfd, buf, buf_size);
