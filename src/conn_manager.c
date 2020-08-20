@@ -1,4 +1,5 @@
 
+#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -76,6 +77,10 @@
 // meaning each request should be responded with a new connection initialized
 // on this machine
 #define CLIENT_FORWARDER 0x40
+
+// to be set when we have a private forward, and this client has already requested
+// a connection with the forward
+#define CLIENT_AWAITING_FORWARD 0x80
 
 
 
@@ -250,9 +255,10 @@ int client_rearm(struct conn_manager * cm, struct client * c) {
     int client_buffer_full = (c->client_buffer_len + c->client_buffer_offset == sizeof(c->client_buffer));
     int host_buffer_full = (c->host_buffer_len + c->host_buffer_offset == sizeof(c->host_buffer));
 
-    int client_buffer_ready = (c->flags & HOST_READ_END_CLOSED) ||
+    // FIXME double check this l8tr
+    int client_buffer_ready = !(c->flags & CLIENT_READ_END_CLOSED) &&
         (c->client_buffer_len > 0);
-    int host_buffer_ready = (c->flags & CLIENT_READ_END_CLOSED) ||
+    int host_buffer_ready = !(c->flags & HOST_READ_END_CLOSED) &&
         (c->host_buffer_len > 0);
 
     /*fprintf(stderr, "Rearm client%s%s\n", !host_buffer_full ? " read" : "",
@@ -352,6 +358,37 @@ void client_read_end_closed(struct conn_manager * cm, struct client * c) {
 }
 
 
+static void client_list_init(struct conn_manager * cm) {
+    cm->list_front = NULL;
+    cm->list_back = NULL;
+}
+
+static void client_list_append(struct conn_manager * cm, struct client * c) {
+    if (cm->list_back == NULL) {
+        cm->list_back = c;
+        cm->list_front = c;
+    }
+    else {
+        cm->list_back->next = c;
+        cm->list_back = c;
+    }
+}
+
+static struct client * client_list_pop(struct conn_manager * cm) {
+    struct client * ret;
+    if (cm->list_back == cm->list_front) {
+        ret = cm->list_back;
+        cm->list_back = NULL;
+        cm->list_front = NULL;
+    }
+    else {
+        ret = cm->list_front;
+        cm->list_front = ret->next;
+    }
+    return ret;
+}
+
+
 static int has_private_forward(struct conn_manager * cm) {
     return (cm->flags & PRIVATE_FORWARDING) != 0;
 }
@@ -386,8 +423,7 @@ static int designate_private_forward(struct conn_manager * cm,
 
     cm->flags |= PRIVATE_FORWARDING;
     cm->private_forward = c;
-
-    cm->client_list = NULL;
+    client_list_init(cm);
 
     __builtin_memset(&cm->pf_addr, 0, sizeof(cm->pf_addr));
 
@@ -397,11 +433,13 @@ static int designate_private_forward(struct conn_manager * cm,
 
 static void request_dup_private_forward(struct conn_manager * cm,
         struct client * c) {
-    const static char buf[] = "please give me another private connection";
+    const static char buf[] = MAGIC_STRING;
     // put bytes to private_forward->dstfd = -1, so it appears as though
     // they are being received by the nonexistent host and should be relayed
     // back
     put_bytes(cm, cm->private_forward, -1, buf, sizeof(buf) - 1);
+    c->flags |= CLIENT_AWAITING_FORWARD;
+    client_list_append(cm, c);
 }
 
 static int is_private_connection(struct conn_manager * cm, int connfd) {
@@ -420,7 +458,7 @@ static int is_private_connection(struct conn_manager * cm, int connfd) {
 }
 
 static void delegate_private_connection(struct conn_manager * cm, int connfd) {
-    struct client * next = cm->client_list;
+    struct client * next = client_list_pop(cm);
 
     if (next == NULL) {
         printf("nobody in queue, forward %d closing\n", connfd);
@@ -428,7 +466,6 @@ static void delegate_private_connection(struct conn_manager * cm, int connfd) {
     }
     else {
         printf("Giving private forward (%d) to %d\n", connfd, next->clientfd);
-        cm->client_list = next->next;
         next->next = NULL;
         next->flags &= !CLIENT_IN_LIST;
         next->dstfd = connfd;
@@ -655,14 +692,25 @@ int conn_manager_set_private_retrieval(struct conn_manager * cm,
     // connection request messages
     c->flags |= CLIENT_FORWARDER;
 
+    // and put it in the event queue
+    client_rearm(cm, c);
+
     free(passwd);
     return 0;
 }
 
 /*
- * initialize connection to the given client
+ * initialize another connection to the proxy hosted over the connection in c
  */
 static int _initialize_connection_to(struct conn_manager * cm, struct client * c) {
+
+    // flush the socket
+    char buf[sizeof(MAGIC_STRING) - 1];
+    if (read(c->clientfd, buf, sizeof(buf)) != sizeof(buf)) {
+        fprintf(stderr, "bad init connection request\n");
+        client_rearm(cm, c);
+        return -1;
+    }
 
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
@@ -894,48 +942,7 @@ static int put_bytes(struct conn_manager * cm, struct client * c, int connfd,
     int from_client = (connfd == c->clientfd);
 
     if (from_client) {
-        if (c->dstfd == -1) {
-            if (conn_manager_has_forward(cm)) {
-                c->dstfd = conn_manager_dup_forward_fd(cm);
-            }
-            else if (has_private_forward(cm)) {
-                printf("%d requests private forward\n", connfd);
-                request_dup_private_forward(cm, c);
-                // don't rearm until we get a response
-                return 0;
-            }
-            else if (is_requesting_private_forward(buf, n_bytes)) {
-                printf("designating\n");
-                designate_private_forward(cm, c);
-                return client_rearm(cm, c);
-            }
-            else {
-                int req_type;
-                int res = _resolve_host(cm, c, buf, &req_type);
-                if (res == -1) {
-                    // TODO buffer this
-                    const static char bad_request[] = "HTTP/1.1 400 BAD REQUEST\r\n\r\n";
-                    write(c->clientfd, bad_request, sizeof(bad_request) - 1);
-
-                    // rearm clientfd for reading in event queue
-                    return client_rearm(cm, c);
-                }
-                c->dstfd = res;
-
-                if (req_type == TYPE_CONNECT) {
-                    // write OK response
-                    // TODO buffer this
-                    const static char ok_response[] = "HTTP/1.1 200 OK\r\n\r\n";
-                    if (write(c->clientfd, ok_response, sizeof(ok_response) - 1) !=
-                            sizeof(ok_response) - 1) {
-                        fprintf(stderr, "ERROR: Unable to write back OK response\n");
-                    }
-
-                    // rearm clientfd for reading in event queue
-                    return client_rearm(cm, c);
-                }
-            }
-        }
+        assert(c->dstfd != -1);
 
         // record data written to buffer
         c->host_buffer_len += n_bytes;
@@ -982,6 +989,51 @@ static int read_from(struct conn_manager * cm, struct client * c, int connfd) {
 
     if (n_read <= 0) {
         return client_rearm(cm, c);
+    }
+
+    if (from_client && c->dstfd == -1) {
+        if (conn_manager_has_forward(cm)) {
+            printf("plain forward\n");
+            c->dstfd = conn_manager_dup_forward_fd(cm);
+        }
+        else if (has_private_forward(cm)) {
+            printf("%d requests private forward\n", connfd);
+            request_dup_private_forward(cm, c);
+            // don't rearm until we get a response
+            return 0;
+        }
+        else if (is_requesting_private_forward(buf, buf_size)) {
+            printf("designating\n");
+            designate_private_forward(cm, c);
+            return client_rearm(cm, c);
+        }
+        else {
+            printf("regular\n");
+            int req_type;
+            int res = _resolve_host(cm, c, buf, &req_type);
+            if (res == -1) {
+                // TODO buffer this
+                const static char bad_request[] = "HTTP/1.1 400 BAD REQUEST\r\n\r\n";
+                write(c->clientfd, bad_request, sizeof(bad_request) - 1);
+
+                // rearm clientfd for reading in event queue
+                return client_rearm(cm, c);
+            }
+            c->dstfd = res;
+
+            if (req_type == TYPE_CONNECT) {
+                // write OK response
+                // TODO buffer this
+                const static char ok_response[] = "HTTP/1.1 200 OK\r\n\r\n";
+                if (write(c->clientfd, ok_response, sizeof(ok_response) - 1) !=
+                        sizeof(ok_response) - 1) {
+                    fprintf(stderr, "ERROR: Unable to write back OK response\n");
+                }
+
+                // rearm clientfd for reading in event queue
+                return client_rearm(cm, c);
+            }
+        }
     }
 
     //printf("buf: \"%s\"\n", buf);
@@ -1098,6 +1150,7 @@ void conn_manager_start(struct conn_manager *cm) {
                 if (c->flags & CLIENT_FORWARDER) {
                     // this is the proxy forwarding to us, we should respond by
                     // establishing a new connection
+                    printf("responding to connection request\n");
                     _initialize_connection_to(cm, c);
                 }
                 else {

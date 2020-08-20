@@ -40,7 +40,7 @@ struct conn_manager {
             struct sockaddr_in pf_addr;
             struct client * private_forward;
             // list of clients waiting to be matched with a private connection
-            struct client * client_list;
+            struct client * list_front, * list_back;
             uint64_t magic_number;
         };
     };
